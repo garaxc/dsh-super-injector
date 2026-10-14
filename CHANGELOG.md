@@ -5,6 +5,58 @@
 > **版本以 git tag 为准**：已发布 v0.3.1 / v0.3.3（GitHub Releases 资产）；未打 tag 的
 > 小节为开发史（其内容随下一个发布一并交付）。
 
+## [未发布] — 2026-10-15（Desktop 实测：profile 错位 + loader.internal 缺失）
+
+> 本次三处修复均在 DSH Desktop（profile `desktop`、loader 1.0.5、宿主未开
+> `--expose-internals`）实测定位并验证。改动落在 `src/index.ts` 与 `scripts/build.sh`。
+
+### 修复（缺陷 A：profile 名硬编码 'web' ⇒ 注入全部失效）
+
+- **根因**：源码把 profile 名写死为 `'web'`（`join(dshHome,'profiles','web','node_modules')`），
+  且宿主进程**没有** `DSH_PROFILE` / `DSH_PROFILE_DIR`（实测均为 null，另加桌面端走的是
+  `profiles/desktop`）⇒ junction 全建到 `web` profile，当前进程的 loader 看不到 ⇒
+  `dev_inject_plugin` 恒报 `host ✗`。
+- **决定性证据**：同一插件、同一条注入命令，先在 `profiles/desktop` 手工建好 junction
+  后 `host ✗` → `host ✓`、entry 转 `phase 2 = ACTIVE`；根因唯一。
+- **修复**：新增 `deriveProfileNodeModules()`，按 **`ctx.baseUrl`**（loader 自己就按它解析，
+  实测值 `file:///C:/Users/<u>/.dsh/profiles/desktop/`）→ `DSH_PROFILE_DIR` → `DSH_PROFILE`
+  → 唯一 profile 目录 → `'web'` 兜底 的顺序推导；并用 `currentProfileName()` 统一
+  `dev_install_package` 的缺省 profile。
+- **同族修复**：`readProfileBundles()` 原也写死 `profiles/web/package.json`（读到的是
+  **另一个 profile** 的 bundles，防重护栏判错）⇒ 改为跟随当前 profile。
+
+### 修复（缺陷 B：loader.internal 恒 undefined ⇒ 重载/自检/清单全线不可用）
+
+- **根因**：loader 1.0.5 的 `ModuleLoader.fromInternal()` 需要 `--expose-internals`；
+  宿主 `execArgv` 为空 ⇒ `ctx.loader.internal` **恒为 undefined**。而插件多处裸用
+  `ctx.loader.internal`，其中 `listPlugins()` 用非空断言 `internal!` ⇒
+  `dev_plugin_status` 整个工具崩（`Cannot read properties of undefined (reading 'loadCache')`）；
+  `reloadPackage()` 首行直接 return `loader.internal 不可用` ⇒ 热重载/自重载/预检全废
+  —— **连"自重载自修复"这条唯一能免重启修自己的路都被堵死**（必须重启宿主）。
+- **修复**：①`listPlugins()` 改可选访问（拿不到缓存只少一行 entry 路径，清单照常输出）；
+  ②`reloadPackage()` 改为**无缓存降级**：用空 Map 替身让 purge/backup/restore 退化为
+  no-op，并以 `?v=<时间戳>` 的 cache-busting URL 强制重读磁盘（loader 的 `import` 在
+  internal 缺失时会回落原生 `import`，见 loader `lib/index.js:214-227`），重载链路继续可用。
+
+### 修复（build.sh 链接名与源码 import 不一致 ⇒ 编不出 lib）
+
+- 提交 `1df6cde` 把源码 import 从裸名改成 scoped（`@deepseek-ai/cordis` 等），但
+  `scripts/build.sh` 的 `link_pkg` 仍链裸名 `cordis/cosmokit/schemastery`，且缺
+  `@deepseek-ai/dsh-llm` ⇒ `tsc` 直接报 6 个 `TS2307`，`lib/` 编不出来。
+- **修复**：链接名与 import 说明符逐字对齐，并补 `@deepseek-ai/dsh-llm`。
+- 另修 HEAD 上既有的 `TS7006`（`dev_install_package` 的 `execute(args)` 缺标注）。
+
+### 验证
+
+- 修复后 `lib/index.js` 正常产出、`node --check` 通过、`import()` 成功
+  （导出 `name/Config/apply/inject` 齐全）。
+- `deriveProfileNodeModules` 实测对 `ctx.baseUrl` 推出的 `node_modules` 与期望值
+  **逐字相等**；`readProfileBundles` 实测读到 desktop 的 15 条 bundles。
+- ⚠️ 已知环境限制：本机 `F:\dsh-ide` / `dsh-harness` 均为**未构建**源码检出，
+  且 app 运行时包**不含 `.d.ts`**（类型被剥）⇒ 无法在本机做到零 tsc 错误的完整
+  type-check；本次以"产物正确 + 可加载"为验收判据。`dev_self_test` 的
+  「测试插件构建」项依赖一个**已构建**的 checkout 才能全绿。
+
 ## [0.3.3] — 2026-08-15（已发布，git tag v0.3.3）
 
 ### 更新（高性能引导升级为 P1-P23 完整认知）

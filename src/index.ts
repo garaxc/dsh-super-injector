@@ -28,7 +28,7 @@ import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
-import { join, relative, dirname, resolve } from 'node:path'
+import { join, relative, dirname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
@@ -586,7 +586,58 @@ export function apply(ctx: AppContext, config: Config): void {
   // junction 建到错误 profile、loader 找不到包。DSH_HOME 环境变量才是权威。
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   const registryFile = config.registryFile || join(dshHome, 'super-injector', 'registry.json')
-  const profileNodeModules = config.profileNodeModules || join(dshHome, 'profiles', 'web', 'node_modules')
+  // ═══ 当前 profile 的推导（实测踩坑 2026-10-15，缺陷 A）═══
+  // 旧实现把 profile 名**硬编码成 'web'**（join(dshHome,'profiles','web','node_modules')），
+  // 而 Desktop 实际跑的是 `desktop` profile ⇒ junction 全建到 web profile，
+  // 当前进程的 loader 根本看不到 ⇒ dev_inject_plugin 永远报 `host ✗`。
+  // 决定性证据：同一插件同一条命令，手工在 desktop profile 建好 junction 后
+  // host ✗ → host ✓、entry 转 ACTIVE。
+  // ⚠️ 宿主进程里**没有** DSH_PROFILE / DSH_PROFILE_DIR（实测均为 null），
+  // 所以权威来源是 **ctx.baseUrl**（loader 按 profile 目录设置的根 URL）：
+  //   file:///C:/Users/<u>/.dsh/profiles/desktop/
+  // 推导顺序：显式 config → ctx.baseUrl → DSH_PROFILE_DIR → DSH_PROFILE → 'web' 兜底。
+  function deriveProfileNodeModules(): { dir: string; via: string } {
+    const explicit = config.profileNodeModules
+    if (explicit) return { dir: explicit, via: 'config.profileNodeModules' }
+    // ① ctx.baseUrl（最权威：loader 自己就按它解析）
+    try {
+      const base = (ctx as { baseUrl?: string }).baseUrl
+      if (base && base.startsWith('file:')) {
+        const dir = fileURLToPath(base)
+        // 仅接受 …/profiles/<name>/ 形态，避免 baseUrl 指向别处时误判
+        if (/[\\/]profiles[\\/][^\\/]+[\\/]?$/.test(dir)) {
+          return { dir: join(dir, 'node_modules'), via: 'ctx.baseUrl=' + base }
+        }
+      }
+    } catch { /* 推导失败继续下一条 */ }
+    // ② DSH_PROFILE_DIR（若将来宿主补上该变量）
+    const profileDir = process.env.DSH_PROFILE_DIR
+    if (profileDir) return { dir: join(profileDir, 'node_modules'), via: 'DSH_PROFILE_DIR' }
+    // ③ DSH_PROFILE
+    const profileName = process.env.DSH_PROFILE
+    if (profileName) return { dir: join(dshHome, 'profiles', profileName, 'node_modules'), via: 'DSH_PROFILE=' + profileName }
+    // ④ 兜底：唯一存在的 profile 目录只此一个时直接用它（多 profile 时仍回落 web）
+    try {
+      const names = readdirSync(join(dshHome, 'profiles'), { withFileTypes: true })
+        .filter((d) => d.isDirectory()).map((d) => d.name)
+      if (names.length === 1) return { dir: join(dshHome, 'profiles', names[0], 'node_modules'), via: '唯一 profile=' + names[0] }
+    } catch { /* 读目录失败走兜底 */ }
+    return { dir: join(dshHome, 'profiles', 'web', 'node_modules'), via: 'fallback web' }
+  }
+  const _profile = deriveProfileNodeModules()
+  const profileNodeModules = _profile.dir
+  logger.info('[super-injector] profile 解析: %s（via %s）', profileNodeModules, _profile.via)
+
+  /** 当前 profile 的**名字**（从已推导的 node_modules 路径取上级目录名）。
+   * 供 dev_install_package 之类"缺省操作哪个 profile"的调用点使用——
+   * 避免各处再写死 'web'（缺陷 A 同族）。 */
+  function currentProfileName(): string {
+    try {
+      return basename(dirname(profileNodeModules)) || 'web'
+    } catch {
+      return 'web'
+    }
+  }
   // 热重载的 config 合并路径可能缺 schema 新字段（旧 fiber _config + patch 旧值），
   // 防御性兜底（schema 默认值只在 loader 装配时保证）。
   const intervalMs = config.intervalMs ?? 1500
@@ -975,8 +1026,21 @@ export function apply(ctx: AppContext, config: Config): void {
 
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
     const internal = ctx.loader.internal
-    if (!internal) return 'ERROR: loader.internal 不可用'
-    const loadCache = internal.loadCache as Map<string, any>
+    // ⚠️ 实测（2026-10-15，缺陷 B）：宿主未以 --expose-internals 启动 ⇒
+    // loader 1.0.5 的 ModuleLoader.fromInternal() 返回 undefined（实测 execArgv=[]）
+    // ⇒ ctx.loader.internal **恒为 undefined**。旧实现在此直接 return 错误，
+    // 于是热重载/自重载/预检全线不可用 —— 连「自重载自修复」这条唯一能免重启
+    // 修自己的路都被堵死（必须重启宿主）。
+    // 降级：用空 Map 替身（purge/backup/restore 全部退化为 no-op），改靠
+    // cache-busting query 强制重读磁盘（loader.import 本身在 internal 缺失时
+    // 回落原生 import，见 loader lib/index.js:214-227）。
+    const liveCache = internal?.loadCache as Map<string, any> | undefined
+    const noCache = !liveCache || typeof liveCache.keys !== 'function'
+    if (noCache) {
+      logger.warn('[super-injector] loader.internal 不可用（宿主未开 --expose-internals）'
+        + '——重载走无缓存降级路径（cache-busting import）')
+    }
+    const loadCache = (liveCache ?? new Map<string, any>()) as Map<string, any>
 
     const urlKey = (urlMatch ?? match).replace(/\\/g, '/')
     let urls = [...loadCache.keys()].filter((u) => {
@@ -992,6 +1056,11 @@ export function apply(ctx: AppContext, config: Config): void {
     // 包名——按 urlKey（包名）重新匹配会失败。realpathSync(lib) 与 loadCache
     // 的真实 key（realpath URL）一致。
     let entryUrl: string | undefined
+    // ⚠️ 无缓存降级（缺陷 B）：urls 必然为空（拿不到 loadCache 的 key），
+    // 且下面 import 后的「按 real 路径回扫 loadCache」也拿不到 key ⇒ 必须
+    // 直接用**磁盘 realpath URL 的 cache-busting 形式**当 entryUrl。
+    // ?v=<时间戳> 让原生 import 视为新 specifier → 强制重读磁盘文件（不撞
+    // 模块缓存），这正是热重载「重读新代码」的语义。
     if (urls.length === 0) {
       let libPath: string | undefined
       try {
@@ -1012,11 +1081,15 @@ export function apply(ctx: AppContext, config: Config): void {
           // 命中旧模块缓存，loadCache 不产生新 key → 匹配仍失败。realpath URL
           // 是全新 key，强制重新解析磁盘并填充缓存。
           const realLib = realpathSync(libPath)
-          await ctx.loader.import(pathToFileURL(realLib).href, () => [])
+          const bust = pathToFileURL(realLib).href + '?v=' + Date.now()
+          await ctx.loader.import(bust, () => [])
           const real = realLib.replace(/\\/g, '/')
           for (const u of loadCache.keys()) {
             if (typeof u === 'string' && decodeURIComponent(u).includes(real)) { entryUrl = u; break }
           }
+          // 无 loadCache 时（noCache）回扫必然为空 —— 用 cache-busting URL 兜底，
+          // 否则本函数会以「磁盘降级失败」退出，重载再次不可用。
+          if (!entryUrl && noCache) { entryUrl = bust }
         }
       } catch { /* 降级失败继续走下面判断 */ }
       if (entryUrl) {
@@ -1482,12 +1555,19 @@ export function apply(ctx: AppContext, config: Config): void {
   function listPlugins(): string {
     const lines: string[] = []
     const injectedNames = new Set(readRegistry().map((e) => e.name))
+    // ⚠️ 缺陷 B（实测 2026-10-15）：宿主未开 --expose-internals ⇒
+    // loader.internal 为 undefined，旧代码此处用 `internal!` 非空断言直接崩
+    // （Cannot read properties of undefined (reading 'loadCache')）——
+    // dev_plugin_status 整个工具不可用。改为可选访问：拿不到缓存就只少一行
+    // entry 路径，清单本身照常输出。
+    const cache = ctx.loader.internal?.loadCache as Map<string, unknown> | undefined
     for (const entry of ctx.loader.entries()) {
       const opts = entry.options
       if (opts.group) continue
       const state = entry.fiber ? (FIBER_NAMES[entry.fiber.state] ?? `state:${entry.fiber.state}`) : 'no-fiber'
-      const entryUrl = [...ctx.loader.internal!.loadCache.keys()]
-        .find(u => typeof u === 'string' && u.includes(opts.id))
+      const entryUrl = cache
+        ? [...cache.keys()].find(u => typeof u === 'string' && u.includes(opts.id))
+        : undefined
       // 注入插件标记 [injected]（与 bundle 装配区分，避免 hash id 难认）
       const injected = injectedNames.has(opts.name) ? ' [injected]' : ''
       lines.push(`- [${state}] ${opts.id} (${opts.name})${injected}${opts.disabled ? ' [disabled]' : ''}${entryUrl ? '\n    entry: ' + entryUrl : ''}`)
@@ -2421,11 +2501,14 @@ export function apply(ctx: AppContext, config: Config): void {
   /**
    * 读 profile `package.json` 的 `dsh.profile.bundles` 列表（**只读，失败 ⇒ 空数组**）。
    * ★ 用途：**bundles 防重护栏**（见 `restore()` ②）—— 判断"这个包是不是已经由 bundles 装配"。
-   * ⚠️ 路径写死 `profiles/web`：与 `profileNodeModules` 的缺省形态一致（那里也写死 web）。
+   * ⚠️ 路径必须跟随**当前 profile**（缺陷 A 同族，2026-10-15 修）：旧实现写死
+   * `profiles/web`，在 desktop profile 下读到的是**另一个 profile 的 bundles**
+   * ⇒ 防重护栏判错（把已装配的包当成没装配而重复注入）。
+   * 正解：用 profileNodeModules 的父目录（= 当前 profile 根）。
    */
   function readProfileBundles(): string[] {
     try {
-      const pkgPath = join(dshHome, 'profiles', 'web', 'package.json')
+      const pkgPath = join(dirname(profileNodeModules), 'package.json')
       const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
       const list = pkg?.dsh?.profile?.bundles
       return Array.isArray(list) ? list.filter((x: unknown) => typeof x === 'string') : []
@@ -2879,10 +2962,13 @@ export function apply(ctx: AppContext, config: Config): void {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
-    async execute(args) {
+    async execute(args: { dir: string; profile?: string }) {
       return withOpLock(async () => {
       const dir = String(args.dir)
-      const profileName = args.profile ? String(args.profile) : 'web'
+      // ⚠️ 缺省 profile 名必须取**当前 profile**（缺陷 A 同族，2026-10-15 修）：
+      // 旧实现写死 'web'，在 desktop profile 下会把包装进另一个 profile
+      // ⇒ 当前进程永远看不到（正是 dev_inject_plugin 报 host ✗ 的同一根因）。
+      const profileName = args.profile ? String(args.profile) : currentProfileName()
       try {
         const pkgPath = join(dir, 'package.json')
         if (!existsSync(pkgPath)) return 'ERROR: 目录无 package.json: ' + dir

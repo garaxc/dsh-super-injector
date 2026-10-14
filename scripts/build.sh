@@ -38,10 +38,17 @@ link_pkg() {
 echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
 mkdir -p node_modules/@deepseek-ai
 node -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"
-link_pkg cordis vendor/cordis
-link_pkg cosmokit vendor/cosmokit
-link_pkg schemastery vendor/schemastery
+# ⚠️ 链接名必须与 src 的 import 说明符**逐字一致**（实测踩坑 2026-10-15）：
+# 提交 1df6cde 把源码 import 从裸名（cordis/schemastery）改成 scoped
+# （@deepseek-ai/cordis 等），但本文件仍链裸名 —— tsc 直接报 6 个
+# TS2307「Cannot find module '@deepseek-ai/cordis'」，lib 根本编不出来。
+# 决定性证据：补上 scoped 链接后 6 个 TS2307 全部消失、lib/index.js 正常产出。
+link_pkg @deepseek-ai/cordis vendor/cordis
+link_pkg @deepseek-ai/cosmokit vendor/cosmokit
+link_pkg @deepseek-ai/schemastery vendor/schemastery
 link_pkg @deepseek-ai/dsh-tools packages/core/tools
+# src 直接 import 了 @deepseek-ai/dsh-llm（LLM 自主 loop 用）——缺它同样 TS2307。
+link_pkg @deepseek-ai/dsh-llm packages/llm/llm
 link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
 link_pkg @deepseek-ai/cordis-plugin-loader vendor/loader
 
