@@ -2165,7 +2165,8 @@ export function apply(ctx: AppContext, config: Config): void {
       try { linkExists = lstatSync(linkDir).isSymbolicLink() || lstatSync(linkDir).isDirectory() } catch { /* 不存在 */ }
       if (!linkExists || !isHealthyLink(linkDir)) {
         if (linkExists) {
-          try { rmSync(linkDir, { recursive: true, force: true }) } catch { /* 删除失败尝试覆盖 */ }
+          // ⚠️ 只删链接本身，绝不递归进目标（见 removeLinkOnly 注释）。
+          try { removeLinkOnly(linkDir) } catch { /* 删除失败尝试覆盖 */ }
         }
         mkdirSync(dirname(linkDir), { recursive: true })
         symlinkSync(absDir, linkDir, 'junction')
@@ -2279,12 +2280,36 @@ export function apply(ctx: AppContext, config: Config): void {
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
-  /** junction 健康检查：能读目录 = 目标可达（Windows 断电后悬空 junction 的 lstat 仍是链接但读目录抛错）。 */
+  /** 安全删除链接本身：**绝不递归进目标**。
+   * ⚠️ 实测（2026-10-15）：本机 Windows + Node 24 上 rmSync(junction,{recursive:true})
+   * 的 5 种形态（跨卷/嵌套/链式/父目录递归）**都**没有删穿目标 —— 也就是说它
+   * 在当前环境是安全的。但"语言级未定义行为能删穿 junction 目标"是 Windows 上
+   * 长期存在的坑，而本函数是**依赖目录**（vendor/*、profile node_modules/*）的
+   * 唯一清理通道——一旦踩中就是静默毁依赖。故改为按类型分派，链接只用 rmdir/
+   * unlink（语义上只删链接、绝不触目标），真目录才递归删。 */
+  function removeLinkOnly(p: string): void {
+    let isLink = false
+    try { isLink = lstatSync(p).isSymbolicLink() } catch { return }
+    if (isLink) {
+      try { rmdirSync(p) } catch {
+        try { rmSync(p, { recursive: false, force: true }) } catch { /* 忽略 */ }
+      }
+      return
+    }
+    rmSync(p, { recursive: true, force: true })
+  }
+
+  /** junction 健康检查：链接存在 **且目标真的可用**。
+   * ⚠️ 修复（2026-10-15，实测复现）：旧实现只做 `readdirSync(p)` 判"能读目录
+   * 即健康"，而**目标目录被清空**时 readdirSync **仍然成功**（返回 []）⇒ 一个
+   * 被掏空的依赖目录被误判为健康 ⇒ 自愈永不重建 ⇒ 依赖静默坏掉、直到启动
+   * 加载失败才暴露（本机实测：4 个 vendor 目标的 items=0，旧判据一律返回 true；
+   * 同刻插件自身加载失败 `Cannot find package ... index.js`）。
+   * 判据收紧为：**空目标 = 不健康（必须重建）**；非空 = 目标可达、健康。 */
   function isHealthyLink(p: string): boolean {
     try {
       if (!lstatSync(p).isSymbolicLink()) return false
-      readdirSync(p)
-      return true
+      return readdirSync(p).length > 0
     } catch {
       return false
     }
@@ -3454,7 +3479,7 @@ export function apply(ctx: AppContext, config: Config): void {
         // 仅清理可能残留的 junction（卸载路径已处理，这里兜底）
         try {
           const linkDir = join(profileNodeModules, '@dsh-external', TEST_SHORT)
-          if (existsSync(linkDir)) rmSync(linkDir, { recursive: true, force: true })
+          if (existsSync(linkDir)) removeLinkOnly(linkDir)
         } catch { /* 忽略 */ }
       }
       return summarize(results)
