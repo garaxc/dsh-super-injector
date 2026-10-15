@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync, copyFileSync } from 'node:fs'
 import { join, relative, dirname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -67,7 +67,15 @@ if [ ! -x "$TSC" ] && [ ! -f "$TSC.cmd" ]; then
   exit 1
 fi
 
-link_pkg() {
+# ⚠️ 依赖物化用 **copy**，绝不用 junction（2026-10-15 定案）。
+# 事故链：本目录是**一次性临时构建目录**，构建/清理时会整体 rmSync；而目录里
+# 若是 junction，Windows + Node 在递归删除时可能跟随链接、把**链接目标的真实
+# 内容**删空 —— 实测两个 checkout（dsh-harness 与隔离 checkout）里同一组
+# link_pkg 目标全部 items=0，而非 link_pkg 目标的同级包完好无损（1:1 对应）。
+# copy 之后源目录只在读取侧被访问，物理上不可能被本脚本写坏 —— 依赖源的安全
+# 不再依赖"Node 递归删除是否会跟随链接"这一未定义行为。
+# 代价：每次构建多几 MB 复制（实测 <1s），换依赖永不被掏空，值得。
+use_pkg() {
   local target="$CHECKOUT/$2"
   if [ ! -e "$target" ]; then
     echo "build: dependency target missing: $target" >&2
@@ -76,13 +84,25 @@ link_pkg() {
   node -e "
     const fs = require('fs');
     const path = require('path');
-    const link = path.resolve(process.argv[1]);
-    const target = path.resolve(process.argv[2]);
-    fs.rmSync(link, { recursive: true, force: true });
-    fs.mkdirSync(path.dirname(link), { recursive: true });
-    fs.symlinkSync(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+    const dst = path.resolve(process.argv[1]);
+    const src = path.resolve(process.argv[2]);
+    // 清掉旧的 dst（可能是历史遗留的 junction —— 同样只用 rmdir，绝不递归进目标）
+    try {
+      const st = fs.lstatSync(dst);
+      if (st.isSymbolicLink()) fs.rmdirSync(dst);
+      else fs.rmSync(dst, { recursive: true, force: true });
+    } catch { /* 不存在则无需删除 */ }
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    // 递归复制，跳过嵌套 node_modules（保持体积可控、且不引入第二份依赖树）
+    fs.cpSync(src, dst, {
+      recursive: true,
+      dereference: false,
+      filter: (s) => path.basename(s) !== 'node_modules',
+    });
   " "node_modules/$1" "$target"
 }
+# 兼容旧名（模板历史引用）
+link_pkg() { use_pkg "$@"; }
 
 echo "=== Linking build dependencies (checkout: $CHECKOUT) ==="
 mkdir -p node_modules/@deepseek-ai
@@ -2495,9 +2515,17 @@ export function apply(ctx: AppContext, config: Config): void {
         const linkDir = join(profileNodeModules, scope ?? '')
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
         if (!isHealthyLink(linkPath)) {
+          // ⚠️ 只删链接本身：先 lstat 确认是链接才 rmdir；**真目录一律不动**
+          // （真目录意味着这里有实体内容，删掉是数据损失，宁可跳过让用户排查）。
           try {
-            if (existsSync(linkPath)) rmdirSync(linkPath)
-          } catch { /* 坏链接删除失败忽略 */ }
+            const st = lstatSync(linkPath)
+            if (st.isSymbolicLink()) rmdirSync(linkPath)
+            else {
+              logger.warn('[super-injector] 跳过自愈：%s 是真目录而非链接（不删实体内容）', linkPath)
+              continue
+            }
+          }
+          catch { /* 不存在则直接建 */ }
           try {
             mkdirSync(linkDir, { recursive: true })
             symlinkSync(target, linkPath, 'junction')
@@ -3061,10 +3089,179 @@ export function apply(ctx: AppContext, config: Config): void {
   // ═══════════════════════════════════════════════════════════════════
   // A: 插件生产线——scaffold（生成）/ build（构建打包）/ release（发布）
   // ═══════════════════════════════════════════════════════════════════
-  /** DSH checkout 探测（env → 常见路径）。 */
+  /**
+   * 自备隔离 checkout 的路径（注入器私有的构建源）。
+   * 放在 DSH_HOME/super-injector/checkout —— 只由本插件写，外部流程不碰。
+   */
+  function isolatedCheckoutDir(): string {
+    return join(dshHome, 'super-injector', 'checkout')
+  }
+
+  /** 隔离 checkout 是否可用（7 项关键路径齐全）。 */
+  function isolatedCheckoutReady(dir = isolatedCheckoutDir()): boolean {
+    const need = [
+      'packages/core/tools/package.json',
+      'vendor/cordis/package.json',
+      'vendor/cosmokit/package.json',
+      'vendor/schemastery/package.json',
+      'node_modules/@types/node/index.d.ts',
+    ]
+    for (const rel of need) {
+      try { if (!existsSync(join(dir, rel))) return false }
+      catch { return false }
+    }
+    // tsc：允许 .cmd（Windows）或裸文件
+    const bin = join(dir, 'node_modules', '.bin')
+    try {
+      const entries = readdirSync(bin)
+      if (!entries.some((f) => /^tsc(\.cmd|\.ps1)?$/.test(f))) return false
+    }
+    catch { return false }
+    return true
+  }
+
+  /**
+   * 自备隔离 checkout：从**正在运行的 DSH 应用**取包（版本天然匹配），
+   * 加上编译器，组装成一份只被本插件使用的构建源。
+   *
+   * 为什么需要它（2026-10-15 事故链）：
+   *  历史实现复用 `~/dsh-harness` 作为构建源，但那是**共享目录**——别的
+   *  流程（含本插件早期的 junction 物化）会把它掏空，导致自检/构建随机失败
+   *  且原因极难定位（表现为 TS2688/TS2307）。改为自备私有 checkout 后：
+   *  - 版本与运行中的应用一致 ⇒ 类型/导出永不漂移；
+   *  - 只有本插件写它 ⇒ 不再被别的流程破坏；
+   *  - 破坏后可由本函数一键重建（selfHeal 会调用）。
+   *
+   * @returns 就绪的隔离 checkout 路径，或 ''（源不可用/复制失败）
+   */
+  function provisionIsolatedCheckout(): string {
+    const dst = isolatedCheckoutDir()
+    // 定位 DSH 应用自带的 @deepseek-ai 包目录（运行中进程的 ESM 入口就在其中）
+    let appPkgs = ''
+    try {
+      // ctx.baseUrl 指向插件自身的 junction（profile/node_modules/...）
+      // 应用包目录则可由任一已加载包反查；这里用常见安装路径 + 反查兜底。
+      const guesses: string[] = []
+      // 反查：从本插件当前入口向上找到 node_modules/@deepseek-ai
+      try {
+        const selfEntry = fileURLToPath(import.meta.url)
+        let cur = dirname(selfEntry)
+        for (let i = 0; i < 12; i++) {
+          const marker = join(cur, 'node_modules', '@deepseek-ai', 'dsh-tools', 'package.json')
+          if (existsSync(marker)) { guesses.push(join(cur, 'node_modules', '@deepseek-ai')); break }
+          const parent = dirname(cur)
+          if (parent === cur) break
+          cur = parent
+        }
+      }
+      catch { /* 反查失败 */ }
+      // 常见安装路径
+      guesses.push(
+        'D:/app/DSH Desktop/resources/app/node_modules/@deepseek-ai',
+        'C:/Program Files/DSH Desktop/resources/app/node_modules/@deepseek-ai',
+      )
+      for (const g of guesses) {
+        if (existsSync(join(g, 'dsh-tools', 'package.json'))) { appPkgs = g; break }
+      }
+    }
+    catch { /* 定位失败 */ }
+    if (!appPkgs) {
+      logger.warn('[super-injector] 无法定位 DSH 应用包目录 —— 自备 checkout 跳过')
+      return ''
+    }
+
+    /** 递归复制（跳过嵌套 node_modules）。 */
+    const copyTree = (src: string, target: string): void => {
+      mkdirSync(target, { recursive: true })
+      let ents: string[]
+      try { ents = readdirSync(src) } catch { return }
+      for (const name of ents) {
+        if (name === 'node_modules') continue
+        const s = join(src, name)
+        const d = join(target, name)
+        let st
+        try { st = statSync(s) } catch { continue }
+        if (st.isDirectory()) copyTree(s, d)
+        else { try { copyFileSync(s, d) } catch { /* 单个文件失败不阻塞 */ } }
+      }
+    }
+
+    try {
+      const pairs: [string, string][] = [
+        ['cordis', 'vendor/cordis'],
+        ['cosmokit', 'vendor/cosmokit'],
+        ['schemastery', 'vendor/schemastery'],
+        ['dsh-tools', 'packages/core/tools'],
+        ['dsh-llm', 'packages/llm/llm'],
+        ['dsh-system-prompt', 'packages/core/system-prompt'],
+        ['cordis-plugin-loader', 'vendor/loader'],
+        // 完整镜像（类型解析需要：dsh-tools 的 declare module 依赖 dsh-scope/llm/agent/session）
+        ['', 'node_modules/@deepseek-ai'],
+      ]
+      // 先清空目标（只清本插件私有目录）
+      for (const rel of ['vendor', 'packages', 'node_modules/@deepseek-ai']) {
+        try { rmSync(join(dst, rel), { recursive: true, force: true }) } catch { /* 忽略 */ }
+      }
+      for (const [pkg, rel] of pairs) {
+        const src = pkg === '' ? appPkgs : join(appPkgs, pkg)
+        if (!existsSync(src)) { logger.warn('[super-injector] 自备 checkout 缺源: %s', src); continue }
+        copyTree(src, join(dst, rel))
+      }
+      // 编译器等：从当前进程所用 node 的同级 node_modules 找，或复用已有
+      const tsSrcCandidates = [
+        join(appPkgs, '..', 'typescript'),
+        join(appPkgs, '..', '..', 'typescript'),
+      ]
+      for (const ts of tsSrcCandidates) {
+        if (!existsSync(join(ts, 'package.json'))) continue
+        copyTree(ts, join(dst, 'node_modules', 'typescript'))
+        const binSrc = join(ts, '..', '.bin')
+        const binDst = join(dst, 'node_modules', '.bin')
+        mkdirSync(binDst, { recursive: true })
+        try {
+          for (const f of readdirSync(binSrc)) {
+            if (/^tsc(\.cmd|\.ps1)?$/.test(f)) {
+              try { copyFileSync(join(binSrc, f), join(binDst, f)) } catch { /* 忽略 */ }
+            }
+          }
+        }
+        catch { /* 忽略 */ }
+        break
+      }
+      // 最小 package.json（build.sh 的 guard 需要 packages 目录）
+      mkdirSync(join(dst, 'packages', 'core'), { recursive: true })
+      try {
+        writeFileSync(join(dst, 'package.json'), JSON.stringify({
+          name: 'dsh-injector-checkout', private: true, version: '0.0.0',
+          description: 'isolated build checkout provisioned by dsh-super-injector (private; never shared)',
+        }, null, 2) + '\n', 'utf8')
+      }
+      catch { /* 忽略 */ }
+      if (isolatedCheckoutReady(dst)) {
+        logger.info('[super-injector] 自备隔离 checkout 就绪: %s', dst)
+        return dst
+      }
+      logger.warn('[super-injector] 自备隔离 checkout 不完整（缺 tsc 或 @types/node）: %s', dst)
+      return ''
+    }
+    catch (e) {
+      logger.warn('[super-injector] 自备隔离 checkout 失败: %s', String(e))
+      return ''
+    }
+  }
+
+  /** DSH checkout 探测（env → 自备隔离 checkout → 常见路径）。 */
   function detectCheckout(): string {
     const env = (process.env as Record<string, string | undefined>).DSH_CHECKOUT
     if (env && existsSync(join(env, 'packages'))) return env
+    // ★ 优先自备隔离 checkout：只由本插件写、版本对齐运行中的应用、
+    //   被破坏可一键重建（provisionIsolatedCheckout）。共享的 ~/dsh-harness
+    //   曾因被外部流程掏空而导致构建随机失败（2026-10-15 事故）。
+    const iso = isolatedCheckoutDir()
+    if (isolatedCheckoutReady(iso)) return iso
+    // 自备缺失 ⇒ 现场组装一次（首次使用/被清空时）
+    const provisioned = provisionIsolatedCheckout()
+    if (provisioned) return provisioned
     const candidates = [
       join(homedir(), 'dsh-harness'),
       join(homedir(), 'dsh'),
@@ -3344,6 +3541,32 @@ export function apply(ctx: AppContext, config: Config): void {
       const TEST_PKG = '@dsh-external/selftest-runner'
       const TEST_SHORT = 'selftest-runner'
       const tmpDir = join(dshHome, 'super-injector', TEST_SHORT)
+      // ⚠️ 清理 tmpDir 前先把里面可能的链接（历史版本的 junction 残留）拆掉，
+      // 再整体删。原因：本目录若含 junction，递归删除在 Windows + Node 上可能
+      // 跟随链接删空**目标**（实测两组 checkout 的同一批 link 目标全被掏空）。
+      // 现在的 build.sh 已改用 copy 物化依赖，不再产生 junction；这里保留
+      // 拆链兜底，兼容旧版本残留 + 防未来回归。
+      try {
+        const nm = join(tmpDir, 'node_modules')
+        const stripLinks = (dir: string, depth = 0): void => {
+          if (depth > 6) return
+          let ents: string[] = []
+          try { ents = readdirSync(dir) } catch { return }
+          for (const name of ents) {
+            const p = join(dir, name)
+            let isLink = false
+            try { isLink = lstatSync(p).isSymbolicLink() } catch { continue }
+            if (isLink) {
+              try { rmdirSync(p) } catch { /* 忽略 */ }
+            }
+            else {
+              try { if (statSync(p).isDirectory()) stripLinks(p, depth + 1) } catch { /* 忽略 */ }
+            }
+          }
+        }
+        stripLinks(nm)
+      }
+      catch { /* 忽略 */ }
       try { rmSync(tmpDir, { recursive: true, force: true }) } catch { /* 忽略 */ }
       mkdirSync(tmpDir, { recursive: true })
       try {
@@ -3359,7 +3582,7 @@ export function apply(ctx: AppContext, config: Config): void {
         }, null, 2) + '\n', 'utf8')
         writeFileSync(join(tmpDir, 'tsconfig.json'), '{\n  "compilerOptions": {\n    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext", "lib": ["ES2023"],\n    "strict": true, "types": ["node"], "declaration": true, "declarationDir": "lib/types",\n    "outDir": "lib", "rootDir": "src", "skipLibCheck": true, "esModuleInterop": true,\n    "sourceMap": true\n  },\n  "include": ["src"]\n}\n', 'utf8')
         writeFileSync(join(tmpDir, 'src', 'index.ts'), `import type { Context } from '@deepseek-ai/cordis'\nimport { defineTool } from '@deepseek-ai/dsh-tools'\nexport const name = ${JSON.stringify(TEST_PKG)}\nexport const inject = ['tools']\nexport function apply(ctx: Context): void {\n  ctx.effect(() => ctx.tools.register(defineTool({\n    name: 'self_test_hello',\n    description: 'self test',\n    parameters: {},\n    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },\n    async execute() { return 'hello' },\n  })), 'self-test')\n}\n`, 'utf8')
-        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\nlink_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const l=path.resolve(process.argv[1]);const t=path.resolve(process.argv[2]);fs.rmSync(l,{recursive:true,force:true});fs.mkdirSync(path.dirname(l),{recursive:true});fs.symlinkSync(t,l,process.platform==='win32'?'junction':'dir');" "node_modules/$1" "$2"\n}\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true})"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
+        writeFileSync(join(tmpDir, 'scripts', 'build.sh'), `#!/bin/bash\nset -euo pipefail\nROOT="$(cd "$(dirname "$0")/.." && pwd)"\ncd "$ROOT"\nCHECKOUT="\${DSH_CHECKOUT:-}"\nif [ -z "$CHECKOUT" ] || [ ! -d "$CHECKOUT/packages" ]; then echo "no checkout" >&2; exit 1; fi\nTSC="$CHECKOUT/node_modules/.bin/tsc"\n# 依赖物化用 copy，绝不用 junction：本目录是一次性构建目录，整体递归删除时\n# junction 会让 Windows/Node 跟随链接删空**目标**（实测两组 checkout 的同一批\n# link 目标全被掏空）。copy 后源只在读取侧被访问，物理上不可能被写坏。\nuse_pkg() {\n  node -e "const fs=require('fs');const path=require('path');const dst=path.resolve(process.argv[1]);const src=path.resolve(process.argv[2]);try{const st=fs.lstatSync(dst);if(st.isSymbolicLink())fs.rmdirSync(dst);else fs.rmSync(dst,{recursive:true,force:true});}catch{};fs.mkdirSync(path.dirname(dst),{recursive:true});fs.cpSync(src,dst,{recursive:true,dereference:false,filter:(s)=>path.basename(s)!=='node_modules'});" "node_modules/$1" "$2"\n}\nlink_pkg() { use_pkg "$@"; }\nmkdir -p node_modules/@deepseek-ai\nnode -e "const fs=require('fs');try{const s=fs.lstatSync('node_modules/@standard-schema');if(s.isSymbolicLink())fs.rmdirSync('node_modules/@standard-schema');else fs.rmSync('node_modules/@standard-schema',{recursive:true,force:true});}catch{}"\nlink_pkg @deepseek-ai/cordis "$CHECKOUT/vendor/cordis"\nlink_pkg cosmokit "$CHECKOUT/vendor/cosmokit"\nlink_pkg @deepseek-ai/schemastery "$CHECKOUT/vendor/schemastery"\nlink_pkg @deepseek-ai/dsh-tools "$CHECKOUT/packages/core/tools"\nlink_pkg @types/node "$CHECKOUT/node_modules/@types/node"\n"$TSC" -p tsconfig.json\n`, 'utf8')
         const checkout = detectCheckout()
         if (!checkout) { check('checkout 探测', false, '无 DSH_CHECKOUT'); return summarize(results) }
         // ── 2. 构建测试插件 ──
