@@ -1711,7 +1711,7 @@ export function apply(ctx: AppContext, config: Config): void {
     parameters: {
       name: { type: 'string', required: true, description: '工具名（唯一）' },
       description: { type: 'string', required: true, description: '工具描述' },
-      parameters: { type: 'json', description: '参数 schema（可选，留空则无参）' },
+      parameters: { type: 'json', description: '参数 schema（可选，留空则无参）。推荐 ParameterSchemaSpec 裸属性表：{ dir: { type: "string", required: true, description: "..." } }；写 JSON Schema（{type:"object",properties:{...},required:[...]}）也可，转正时会自动转换' },
       execute: { type: 'string', required: true, description: 'JS 代码：function(args, ctx){ return ... }' },
     },
     output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
@@ -1788,6 +1788,43 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   }))
 
+  /**
+   * 把 staging 里存的 parameters **归一化**成 defineTool 要求的 ParameterSchemaSpec。
+   *
+   * ⚠️ 实测 bug（2026-10-15，转正链路首测暴露）：staging 的 parameters 常写成
+   * JSON Schema（`{ type:'object', properties:{ dir:{type:'string'} }, required:[...] }`），
+   * 而 defineTool 要的是 **ParameterSchemaSpec —— 裸属性表**（`{ dir:{type:'string'} }`）。
+   * 旧实现直接 `parameters: t.parameters as never` 透传，于是转正时报
+   * `JsonSchemaError: unsupported JSON schema: parameters.type must be a value schema object`
+   * ——报错信息完全没提「形状不对」，极难定位。
+   *
+   * 本函数两种形状都接受：
+   *   - 已是裸属性表（无顶层 type/properties）⇒ 原样使用；
+   *   - JSON Schema 对象（有 properties）⇒ 抽出 properties，并把 required 数组
+   *     转成各属性的 `required: true`（ParameterSchemaSpec 的写法）。
+   * 同时把 `required` 从属性对象里保留（两种写法都兼容，DSH 只认属性上的 required）。
+   */
+  function normalizeParams(raw: unknown): Record<string, unknown> {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const obj = raw as Record<string, unknown>
+    const looksLikeJsonSchema =
+      typeof obj.type === 'string' || (obj.properties !== null && typeof obj.properties === 'object')
+    if (!looksLikeJsonSchema) return obj // 已是裸属性表
+    const props = (obj.properties ?? {}) as Record<string, unknown>
+    const required = Array.isArray(obj.required) ? (obj.required as string[]) : []
+    const out: Record<string, unknown> = {}
+    for (const [key, spec] of Object.entries(props)) {
+      if (spec === null || typeof spec !== 'object' || Array.isArray(spec)) {
+        out[key] = { type: 'string' }
+        continue
+      }
+      const s = { ...(spec as Record<string, unknown>) }
+      if (required.includes(key)) s.required = true
+      out[key] = s
+    }
+    return out
+  }
+
   safeRegister(defineTool({
     name: 'dev_stage_promote',
     description: '转正：把 staging 工具一键挂"前侧"（正式注册进 tools schema，下一次请求缓存刷新一次）。确认工具有效后使用。',
@@ -1802,7 +1839,8 @@ export function apply(ctx: AppContext, config: Config): void {
         const dispose = ctx.effect(() => ctx.tools.register(defineTool({
           name: a.name,
           description: t.description,
-          parameters: t.parameters as never,
+          // ⚠️ 必须归一化：JSON Schema → ParameterSchemaSpec（详见 normalizeParams）
+          parameters: normalizeParams(t.parameters) as never,
           output: { schema: { type: 'string' }, render: (_x: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
           async execute(args: Record<string, unknown>) {
             return String(await t.execute(args, ctx))
@@ -1811,6 +1849,8 @@ export function apply(ctx: AppContext, config: Config): void {
         t.disposer = () => dispose()
       } catch (e) {
         return 'ERROR: 转正注册失败: ' + String(e)
+          + '\n提示：parameters 需为 ParameterSchemaSpec（裸属性表，如 { dir: { type: "string" } }）；'
+          + '若写的是 JSON Schema（含 type/properties），本工具会自动转换——若仍失败请检查属性 schema 是否合法。'
       }
       t.promoted = true
       saveStaging()
