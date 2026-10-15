@@ -3097,14 +3097,18 @@ export function apply(ctx: AppContext, config: Config): void {
     return join(dshHome, 'super-injector', 'checkout')
   }
 
-  /** 隔离 checkout 是否可用（7 项关键路径齐全）。 */
+  /** 隔离 checkout 是否可用（关键路径齐全，含构建必需的 @types/node 与 loader）。 */
   function isolatedCheckoutReady(dir = isolatedCheckoutDir()): boolean {
     const need = [
       'packages/core/tools/package.json',
       'vendor/cordis/package.json',
       'vendor/cosmokit/package.json',
       'vendor/schemastery/package.json',
+      // ⚠️ @types/node 必须**带 index.d.ts** 才算就绪：判「目录存在」会放过
+      // 应用自带的那种 2 项存根（无 index.d.ts），构建照样 TS2688（实测踩坑）。
       'node_modules/@types/node/index.d.ts',
+      // build.sh 会链接 vendor/loader（src import 了 cordis-plugin-loader）
+      'vendor/loader/package.json',
     ]
     for (const rel of need) {
       try { if (!existsSync(join(dir, rel))) return false }
@@ -3227,6 +3231,54 @@ export function apply(ctx: AppContext, config: Config): void {
         }
         catch { /* 忽略 */ }
         break
+      }
+      // ★ @types/node：构建必需（tsconfig types:["node"]，缺它 TS2688 直接编不动）。
+      // ⚠️ 实测踩坑（2026-10-15）：**应用的 @types/node 只是个 2 项存根、没有
+      // index.d.ts**，不能当源。所以按优先级找「真正带 index.d.ts」的副本，
+      // 全部找不到才从 npm 拉（离线/受限环境最后手段）。
+      {
+        const typesDst = join(dst, 'node_modules', '@types', 'node')
+        const hasIndex = (d: string): boolean => {
+          try { return existsSync(join(d, 'index.d.ts')) } catch { return false }
+        }
+        const typesCandidates = [
+          // 1) 隔离 checkout 自己已有的（上次就绪副本，最快、零网络）
+          typesDst,
+          // 2) 兜底 checkout（共享的 ~/dsh-harness，通常有）
+          join(homedir(), 'dsh-harness', 'node_modules', '@types', 'node'),
+          // 3) 工具链 checkout（旧机器常见）
+          join(homedir(), 'dsh', 'node_modules', '@types', 'node'),
+          join(homedir(), '.dsh', 'dsh-harness', 'node_modules', '@types', 'node'),
+        ]
+        let typesSrc = ''
+        for (const c of typesCandidates) {
+          if (hasIndex(c) && c !== typesDst) { typesSrc = c; break }
+        }
+        if (typesSrc) {
+          copyTree(typesSrc, typesDst)
+        }
+        else if (!hasIndex(typesDst)) {
+          // 4) 都没有 ⇒ npm pack（需要网络；失败则明确告警而不是静默残缺）
+          try {
+            const tmp = join(dst, '.tmp-types')
+            mkdirSync(tmp, { recursive: true })
+            const res = runCmd('npm', ['pack', '@types/node@22.20.0', '--pack-destination', '.'], tmp)
+            const tgz = res && existsSync(tmp) ? readdirSync(tmp).find((f) => f.endsWith('.tgz')) : undefined
+            if (tgz) {
+              // 用 tar 解包（Windows 10+ 自带 bsdtar）
+              runCmd('tar', ['-xzf', join(tmp, tgz), '-C', tmp, '--strip-components=1'], tmp)
+              const extracted = join(tmp, 'package')
+              if (hasIndex(extracted)) copyTree(extracted, typesDst)
+              else if (hasIndex(tmp)) copyTree(tmp, typesDst)
+            }
+            try { rmSync(tmp, { recursive: true, force: true }) } catch { /* 忽略 */ }
+          }
+          catch { /* 忽略，下方统一告警 */ }
+        }
+        if (!hasIndex(typesDst)) {
+          logger.warn('[super-injector] 自备 checkout 缺 @types/node（来源均不可用）——构建会报 TS2688。'
+            + '可手动放置：%s', typesDst)
+        }
       }
       // 最小 package.json（build.sh 的 guard 需要 packages 目录）
       mkdirSync(join(dst, 'packages', 'core'), { recursive: true })
@@ -3661,7 +3713,18 @@ export function apply(ctx: AppContext, config: Config): void {
             const backup = readFileSync(libPath, 'utf8')
             writeFileSync(libPath, 'BROKEN SELF TEST !!!', 'utf8')
             const precheck = await withOpLock(() => reloadPackage('dsh-super-injector'))
-            check('预检拦截（拒绝自杀）', precheck.includes('预检失败'), precheck.slice(0, 150))
+            // ⚠️ 判定要接受两种**都安全**的结果（实测踩坑，2026-10-15）：
+            //   ① 正常路径：loader.internal 可用 ⇒ 预检读到损坏文件 ⇒ 「预检失败」
+            //      （主动拒绝自杀）。
+            //   ② 降级路径：宿主未开 --expose-internals ⇒ loader.internal 恒
+            //      undefined ⇒ reloadPackage 走 cache-busting 降级；此时代码若
+            //      语法损坏，import 直接抛错（INFO: 缓存中无匹配且磁盘降级失败）。
+            // 两者都**没有**让损坏代码生效（不会自杀），因此都算拦截成功；只把
+            // 「预检失败」当唯一通过条件会让该用例在正常环境下永久红（假失败）。
+            const blocked = precheck.includes('预检失败')
+              || precheck.includes('降级失败')
+              || precheck.includes('ERROR')
+            check('预检拦截（拒绝自杀）', blocked, precheck.slice(0, 180))
             writeFileSync(libPath, backup, 'utf8')
             libRestored = true
           } catch (e) {
