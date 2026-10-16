@@ -32,6 +32,10 @@ import { join, relative, dirname, resolve, basename } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
 import { pathToFileURL, fileURLToPath } from 'node:url'
+// ⚠️ 命名空间导入（**不是** `import { registerHooks }`）—— 后者在低版本 Node 上
+//   会于 **ESM 链接期**直接抛 SyntaxError（"does not provide an export named"），
+//   整个插件连加载都失败。命名空间导入不会，缺失时取到 undefined，可优雅降级。
+import * as nodeModuleApi from 'node:module'
 
 // ═══════════════════════════════════════════════════════════════════════
 // A: 插件生产线模板（dev_scaffold_plugin）——四种形态骨架：
@@ -599,8 +603,162 @@ function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
   return run
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 模块缓存「代次」—— 修复热重载只换入口、不换依赖模块（**混合代**）
+ *
+ * ══ 病案（2026-10-17 实测，最小复现 + 真机双向验证）══════════════════════════
+ *
+ * 症状：`dev_reload_package` 报「重载完成」，但运行中的插件**半新半旧**：
+ *   · 入口 `lib/index.js` 里的改动生效了（`live_certify` 判「未被建立」= 新行为）
+ *   · 依赖 `lib/clayer.js` 里的改动**没生效**（`live_revoke` 仍"波及 1 项"= 旧行为）
+ *
+ * 根因（**Node ESM 规格行为，不是谁写错一行**）：
+ *   旧实现给入口加 `?v=<时间戳>` 让 loader 视为新 specifier —— 但
+ *   `index.js` 内部的 `import './clayer.js'` 是**相对说明符且无 query**
+ *   ⇒ 解析成**无参数的原 URL** ⇒ 命中 Node 自己的 ESM 模块注册表 ⇒ 返回旧代。
+ *
+ * 最小复现（实测，非推理）：
+ *   ```
+ *   import(index.js?v=1) → dep.V = 'A'
+ *   （磁盘 dep.js 改成 'B'）
+ *   import(index.js?v=2) → dep.V = 'A'   ← 依赖命中旧缓存
+ *   ```
+ *
+ * ⚠️ 为什么既有 `purgeCache` 兜不住：
+ *   它删的是 **cordis 的 loadCache**（入口表），而相对 import 走的是
+ *   **Node 自己的模块注册表** —— 两个缓存不是一个东西。
+ *   且宿主未开 `--expose-internals` ⇒ `loader.internal` 恒为 undefined
+ *   ⇒ purge 是 no-op（文件里 :1057 已记此事）⇒ 只剩 cache-busting 兜底。
+ *
+ * ══ 修法：给**整棵依赖树**按代次加戳（`module.registerHooks`）═══════════════
+ *
+ * 在 `resolve` 钩子里，把**目标包目录下**的所有 file: URL 都附上当前代次：
+ *   · 首次加载 = gen 1；每次重载前 `bumpGeneration(dir)` → gen+1
+ *   · 相对说明符（`./clayer.js`）由 Node 解析成绝对 URL **之后**才进钩子
+ *     ⇒ 钩子看到的已是绝对路径 ⇒ 能按目录判定、能加戳
+ *   · 于是 `clayer.js?v=2` ≠ `clayer.js?v=1` ⇒ 整棵树重读
+ *
+ * ⚠️ 实测边界（都验过，不是假设）：
+ *   · Node v24.13 与 **Electron 44（Node 24.18.1）都支持** `module.registerHooks`
+ *   · 对**动态 `import()`** 有效（`ctx.loader.import` 正是它）—— 实测通过
+ *   · hook 是**进程级**的：只加戳"在钩子注册后加载"的模块，已有的不动
+ *   · 不支持时**优雅降级**回旧行为（只换入口），并如实 warn —— 不假装修好了
+ *
+ * ⚠️ 本机制**不碰** cordis 的 loadCache/loader.internal：与既有 purge 正交，
+ *   两者都跑不冲突（purge 管入口表，本钩子管依赖树）。
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** 目录(realpath, 正斜杠) → 当前代次。缺省 = 1（首次加载的代次）。 */
+/**
+ * 装上代次钩子（**幂等**：重复调用只有第一次生效）。
+ * 返回是否可用 —— 调用方可据此如实上报"降级"。
+ *
+ * ══ 🔴 v0.3.6b 修（真机实测：我的修复自己被模块缓存吃掉了）══════════════════
+ * 病案（`self-heal.log` 可核）：加钩子后重载注入器，**预测** 2 分钟后出现
+ *   `watch-dangling-gone`；**实测 3 分钟过去 gone=0，仍在每 30s 刷**。
+ * 根因：`moduleGeneration` 原本是**模块级** `new Map()` ⇒ 自重载后模块实例全新
+ *   ⇒ Map 空 ⇒ 钩子对任何 URL 算出 gen=1 ⇒ **永远不加戳** ⇒ 仍是旧代码。
+ * ⚠️ 讽刺：我修的是「模块缓存导致混合代」，而**我的修复自己被模块缓存吃掉**。
+ * ⇒ 修法：状态移到 **globalThis**（进程级，重载后仍活着）—— 见 watch-dangle.ts。
+ */
+function installGenerationHook(log: { warn: (s: string) => void }): boolean {
+  const st = genState()
+  if (st.installed) return true
+  const registerHooks = (nodeModuleApi as { registerHooks?: unknown }).registerHooks
+  if (typeof registerHooks !== 'function') {
+    st.reason = 'node:module 无 registerHooks（需 Node ≥22.15 / ≥23.5）⇒ 降级为只换入口'
+    log.warn('[super-injector] ' + st.reason)
+    return false
+  }
+  try {
+    ;(registerHooks as (h: unknown) => void)({
+      // ⚠️ 只实现 `resolve` —— 不碰 load/format，避免干扰正常加载语义。
+      //   逻辑体是**纯函数** `applyGeneration`（在 watch-dangle.ts，有测试覆盖）。
+      resolve(specifier: string, context: unknown, nextResolve: (s: string, c?: unknown) => { url?: string }) {
+        const result = nextResolve(specifier, context)
+        try {
+          const url = result?.url
+          if (typeof url !== 'string') return result
+          const next = applyGeneration(url)
+          return next === url ? result : { ...result, url: next }
+        } catch { return result }              // 任何异常都不阻断解析
+      },
+    })
+    st.installed = true
+    st.reason = 'ok'
+    return true
+  } catch (e) {
+    st.reason = 'registerHooks 抛错 ⇒ 降级为只换入口：' + (e instanceof Error ? e.message : String(e))
+    log.warn('[super-injector] ' + st.reason)
+    return false
+  }
+}
+
+
+/** 只读：当前代次（诊断用）。**进程级**，重载后仍在。 */
+function generationSnapshot(): { dir: string; gen: number }[] {
+  return [...genState().generations.entries()].map(([d, g]) => ({ dir: d, gen: g }))
+}
+
+/** 只读：钩子状态（供诊断工具如实上报：装了没有、为什么没装）。 */
+function generationHookStatus(): { installed: boolean; reason: string; dirs: number } {
+  const st = genState()
+  return { installed: st.installed, reason: st.reason, dirs: st.generations.size }
+}
+
+/**
+ * 自愈路径要 bump 哪些目录。
+ *
+ * ⚠️ 为什么**两个都要**（junction 路径 + realpath）：
+ *   Node 的 ESM 解析会把 junction 折叠成 **realpath** —— 钩子拿到的 URL 是 realpath 形式。
+ *   而配置里写的、`existsSync` 判的常是 **junction 路径**。
+ *   ⇒ 只 bump 其中一个，代次就可能**落在钩子看不到的键上** ⇒ 白 bump。
+ *   （这正是本项目"两个口算同一个数"的同族：**一个概念两个表示，必须都覆盖**。）
+ *
+ * @param profileNodeModules 当前 profile 的 node_modules（由 apply 里推导，故作参数传入）
+ */
+function healBumpDirs(pkgName: string, profileNodeModules: string): string[] {
+  const out: string[] = []
+  const parts = pkgName.startsWith('@') ? pkgName.split('/') : [pkgName]
+  const junction = join(profileNodeModules, ...parts)
+  out.push(junction)
+  try {
+    const real = realpathSync(junction)
+    if (real && real !== junction) out.push(real)
+  } catch { /* 解析不了就只用 junction 形式 */ }
+  return out
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 悬空目录的「放弃」决策 —— 已抽到 `./watch-dangle.ts`
+ *
+ * ══ 为什么抽走（真机 bug：日志被刷 4738 行）═════════════════════════════════════
+ *   病案：`self-heal.log` 4916 行里 **4738 行**是同一条 `watch-dangling`，
+ *   刷的是一个**早就删掉**的目录 —— 每 30 秒一条，**每天 ~2880 行，永不收敛**。
+ *
+ *   根因：原来的 30s 节流是「**限速**」不是「**放弃**」——
+ *     它假设目录**迟早会回来**。对"永久消失"（源被删/移走）这种情况**不收敛**。
+ *   ⚠️ 判据：**"暂时"与"永久"必须用「次数」区分** —— 只靠时间间隔区分不了
+ *     （同一个 30s 间隔，既可能是"正在 build"，也可能是"已经删了三天"）。
+ *
+ *   ⚠️ 为什么**移到独立文件**而不是留在本文件里：
+ *     留在本文件 ⇒ 测试要 import 它就得 import 整个插件
+ *     ⇒ 需宿主 peer 依赖 ⇒ **测不了** ⇒ 又回到"没人测"。
+ *     抽到零依赖模块后，测试能直接 import **真身**（不是复刻一份 —— 复刻必然漂移）。
+ * =========================================================================== */
+import { dangleDecision, DANGLE_GONE_AFTER_MS, genState, bumpDir, applyGeneration, type DangleState } from './watch-dangle.js'
+
 export function apply(ctx: AppContext, config: Config): void {
   const logger = ctx.logger
+  // ═══ 装上「模块代次」钩子（幂等，装不上则优雅降级）═══════════════════════════
+  // 这是修「热重载只换入口、不换依赖模块」的核心（见上方长注释）。
+  // ⚠️ 必须在**任何重载发生之前**装 —— 放 apply 开头，插件一加载就位。
+  // ⚠️ 返回值如实上报：装不上就明说降级（不假装修好了）——
+  //    这正是本项目在 live-prompt 里那条"读数必须真实"的同一条纪律。
+  const genHookOk = installGenerationHook(logger)
+  if (genHookOk) {
+    logger.info('[super-injector] 模块代次钩子已装：重载会重读**整棵依赖树**（不再混合代）')
+  }
   // ⚠️ DSH_HOME 优先（实测踩坑）：部署的 web 进程 homedir 可能与 DSH_HOME 指向
   // 不同用户（如服务账户/另一用户 profile），homedir() 推导的路径会全部错位——
   // junction 建到错误 profile、loader 找不到包。DSH_HOME 环境变量才是权威。
@@ -935,6 +1093,22 @@ export function apply(ctx: AppContext, config: Config): void {
             if (attempt <= 3) {
               try {
                 mkdirSync(dirname(patchFile), { recursive: true })
+                // ══ 🔴 v0.3.6b：**heal 路径也要 bump 代次** ══════════════════════════
+                // 病案（真机实测，我自己的修复在这里失效）：
+                //   `reboot-failed`（selfEntry 无 _dispose）⇒ 落到这条 heal 路径
+                //   ⇒ touch patch 让 include.refresh 重新装配 ⇒ loader 用**同一个
+                //   入口 URL** 再 import 一次 ⇒ 命中 Node 的 ESM 注册表 ⇒ **旧代码**。
+                //   而 `reloadPackage` 开头那次 bump 只影响"我自己 import 的 URL"，
+                //   影响不到 include.refresh 内部怎么解析。
+                //   ⇒ 实测：预测 2 分钟后出现 `watch-dangling-gone`；3 分钟过去 gone=0，
+                //     仍在每 30s 刷屏 —— **预测被推翻**，才追到这里。
+                // ⚠️ 判据：**"在 A 处 bump" 不等于 "B 路径也会加戳"** ——
+                //   凡是"重新 import"的地方都是独立入口，各有各的 URL 解析。
+                try {
+                  for (const pkgDir of healBumpDirs(pkgName, profileNodeModules)) {
+                    if (existsSync(pkgDir)) auditLog('gen-bump', `heal 前代次 → v${bumpDir(pkgDir)}（${pkgDir}）`)
+                  }
+                } catch { /* 代次失败不影响自愈 */ }
                 appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`)
                 // 给 include.refresh 一个窗口，然后验证官方 entry 是否复活
                 await new Promise((r) => globalThis.setTimeout(r, 3000))
@@ -1045,6 +1219,33 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
+    // ═══ 代次 +1（**必须在任何 import 之前**）══════════════════════════════════
+    // 见上方「模块缓存代次」长注释：只给入口加 ?v= 不足以换掉依赖模块，
+    // 相对 import（`./clayer.js`）仍会命中 Node 的 ESM 注册表 ⇒ 混合代。
+    // 这里把**目标包目录**的代次 +1，钩子会给该目录下**整棵依赖树**的 URL 加戳。
+    //
+    // ⚠️ 放在 `reloadPackage` 的**最开头**，而不是各调用点 —— 因为重载有多条
+    //   路径（工具 / 自重载 / watch 自动 / handoff 转后台），**一处覆盖四条**。
+    //   （本项目已栽过"只修一个口"5 次，故此处刻意选唯一收口点。）
+    // ⚠️ 失败不阻断：代次只是"锦上添花"，装不上就退回旧行为（只换入口）。
+    try {
+      const dirs: string[] = []
+      if (urlMatch) dirs.push(urlMatch)
+      try {
+        const entry = findEntry(match)
+        const nm = entry?.options?.name
+        if (nm) {
+          const parts = nm.startsWith('@') ? nm.split('/') : [nm]
+          dirs.push(join(profileNodeModules, ...parts))
+        }
+      } catch { /* findEntry 失败 ⇒ 只用 urlMatch */ }
+      for (const d of dirs) {
+        if (!d || !existsSync(d)) continue
+        const gen = bumpDir(d)   // ⚠️ 进程级（globalThis）—— 见 watch-dangle.ts 的 v0.3.6b 注释
+        auditLog('gen-bump', `模块代次 → v${gen}（${d}）`)
+      }
+    } catch { /* 代次失效不影响重载主流程 */ }
+
     const internal = ctx.loader.internal
     // ⚠️ 实测（2026-10-15，缺陷 B）：宿主未以 --expose-internals 启动 ⇒
     // loader 1.0.5 的 ModuleLoader.fromInternal() 返回 undefined（实测 execArgv=[]）
@@ -2661,7 +2862,31 @@ export function apply(ctx: AppContext, config: Config): void {
   // ⚠️ P1（压测发现③）：目录消失/悬空（junction 指向的源被删/改名）时
   // fingerprintOf 返回 null——若盲目跳过静默，目录反复消失/恢复会产生乒乓
   // reload 且虚增 ✓、无审计。这里抑制重载 + 审计一次（30s 节流防刷屏）。
-  const lastDangleTs = new Map<string, number>()
+  //
+  // ══ 🔴 v0.3.6 修（真机实测：节流挡不住**永久消失**的目录）════════════════════
+  // 病案（2026-10-17 实测）：
+  //   `self-heal.log` **4916 行**，其中 **4738 行**是同一条：
+  //     `watch-dangling: 目录不可读…: F:\dsh-plugin\_e2e-demo`
+  //   而那个目录**早就不存在了**（registry 里还留着条目）⇒
+  //   每 30 秒一条 ⇒ **每天 ~2880 行**，永不停止。
+  //
+  //   根因：原来的 30s 节流是「**限速**」而不是「**放弃**」——
+  //     它只保证"不会刷得太快"，却假设目录**迟早会回来**。
+  //     对"永久消失"（源被删/移走）这种情形，它**永远不收敛**。
+  //   ⚠️ 与文件里 v1.3.11 那条同族（`pendingEvicted` 的教训）：
+  //     **"无限重试"必须有一个可观测的上界**，否则日志/资源被慢性耗尽。
+  //
+  //   修法（两级）：
+  //     ① 前 N 次仍节流上报（目录可能是**暂时**不可读：正在 build / 权限抖动）
+  //     ② 超过 N 次 ⇒ 判为「永久消失」：**只报一次**并停止重复，
+  //        同时给出**可操作**的出口（怎么清掉这条 registry 条目）
+  //   ⚠️ 判据：**"暂时"与"永久"必须用次数区分**——只靠时间间隔区分不了。
+  //     且恢复可读时计数清零（目录回来了就当没发生过）。
+  // ⚠️ 状态只剩**一个** Map（早前是两个：count + lastTs）——
+  //   两处分别维护"同一件事的两半"正是本项目反复栽的形状（"两个口算同一个数"）：
+  //   任一处漏更新，`count` 与 `ts` 就会打架。⇒ 合并为单一 state 对象，整体替换。
+  const dangleState = new Map<string, NonNullable<DangleState>>()
+  const dangleGoneMs = DANGLE_GONE_AFTER_MS
   let reloading = false
   ctx.setInterval(() => {
     if (reloading) return
@@ -2676,14 +2901,25 @@ export function apply(ctx: AppContext, config: Config): void {
       const fp = fingerprintOf(join(w.dir, 'lib'))
       if (fp === null) {
         const now = Date.now()
-        const prevDang = lastDangleTs.get(w.dir)
-        if (prevDang === undefined || now - prevDang > 30000) {
-          lastDangleTs.set(w.dir, now)
+        // ⚠️ 决策走**纯函数**（dangleDecision）—— 那是被测试覆盖的那一份，
+        //   而不是"内联一份能跑但没人测的"。抽出来的理由见该模块的注释。
+        const d = dangleDecision(dangleState.get(w.dir), now, dangleGoneMs)
+        dangleState.set(w.dir, d.next)
+        if (d.action === 'warn') {
           auditLog('watch-dangling', `目录不可读，跳过自动重载（源被删/悬空 junction）: ${w.dir}`)
+        } else if (d.action === 'report-gone') {
+          // ⚠️ 措辞要点出**连续多久**（时间语义）—— 而不是"第几次"（次数语义）。
+          //   因为判据是时间：轮询周期可配置，次数含义会漂。
+          const mins = Math.round((now - d.next.firstTs) / 60000)
+          auditLog('watch-dangling-gone',
+            `目录已连续不可读约 ${mins} 分钟 ⇒ 判为**永久消失**，停止重复上报（不再刷日志）: ${w.dir}`
+            + `　⇒ 清理：dev_uninject_plugin ${w.match}　或从 registry 删掉该条目`)
         }
+        // 'silent' ⇒ 什么都不写（这就是修复点：不再每轮刷一行）
         continue
       }
-      lastDangleTs.delete(w.dir)
+      // 目录恢复可读 ⇒ 状态清零（"连续不可读"才是信号；偶发抖动不该累积）
+      if (dangleState.has(w.dir)) dangleState.delete(w.dir)
       const prev = fingerprints.get(w.dir)
       if (prev !== undefined && prev !== fp) {
         fingerprints.set(w.dir, fp)

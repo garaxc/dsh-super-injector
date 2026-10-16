@@ -125,5 +125,41 @@ fi
 echo "=== Compiling src → lib (tsc $("$TSC" --version)) ==="
 "$TSC" -p tsconfig.json
 
+# ═══════════════════════════════════════════════════════════════════════
+# UI（client bundle）也必须在 build.sh 里构建
+# ═══════════════════════════════════════════════════════════════════════
+# ⚠️ 实测缺口（2026-10-16 审计发现）：此前 build.sh **只跑 tsc**，不构建 client
+# ⇒ lib/client.js 停留在手工构建的旧版本（实测：活跃 client.js 是 2026-08-15 的，
+# 而 src/client/index.ts 是 10-15 的，差了两个月）⇒ UI 面板与源码不同步，
+# 且新机器按 INSTALL.md 走 build.sh 会**完全没有 UI**（package.json 的
+# dsh.client 声明了 platform:web，但产物不存在）。
+#
+# ⚠️ 必须用 tsdown.client.config.ts（**只构建 client**），不能用 tsdown.config.ts
+# ——后者含 hostBundle，会把 tsc 刚产出的 host 覆盖成打包版（238KB → 453KB），
+# 静默改变本地 dev 构建语义（实测踩坑）。发布形态由 prepare.mjs 负责，两条路互不干扰。
+echo "=== Building client bundle (tsdown, client-only) ==="
+if [ ! -f tsdown.client.config.ts ]; then
+  echo "build: ✗ tsdown.client.config.ts 缺失（client 构建配置）" >&2
+  exit 1
+fi
+if [ -f node_modules/.bin/tsdown ]; then
+  node_modules/.bin/tsdown --config tsdown.client.config.ts
+elif [ -f node_modules/.bin/tsdown.cmd ]; then
+  node_modules/.bin/tsdown.cmd --config tsdown.client.config.ts
+else
+  # 本地没装 tsdown：用 npx 拉（与 prepare.mjs 同一策略，首次安装才下载）
+  echo "  local tsdown not found — fetching via npx (first run only)"
+  npx --yes "tsdown@^0.22.14" --config tsdown.client.config.ts
+fi
+
+# 判据：声明了 client（dsh.client.platform）就必须产出 lib/client.js，
+# 且 **host 不得被 client 构建改动**（防止再次误用全量配置）
+if ! grep -q '"platform"' package.json 2>/dev/null; then
+  echo "build: package.json 未声明 dsh.client —— 跳过 client 产物校验"
+elif [ ! -f lib/client.js ]; then
+  echo "build: ✗ package.json 声明了 dsh.client，但 lib/client.js 未产出 —— UI 面板将不可用" >&2
+  exit 1
+fi
+
 echo "=== Build complete ==="
 ls -la lib/ lib/types/ 2>/dev/null
