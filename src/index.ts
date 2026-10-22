@@ -387,11 +387,17 @@ export function apply(ctx: Context, config: Config): void {
 const SCAFFOLD_UI_CLIENT = (pkgName: string): string => `/**
  * ${pkgName} — client 面板（conversation.view slot）。
  * 构建：npm run build:client（tsdown，产物 lib/client.js，ModuleLoader.load 注册）。
- * ⚠️ 两个必坑（2026-08 实测）：① apply 用 ctx.slots 必须 export const inject
- * = ['slots']（服务注入声明）；② register 必须带 name 字段（= slot 名，
- * 如 conversation.view）——缺 name 报 "slot undefined is not declared"。
+ * ⚠️ 三个必坑（2026-08 与 2026-10 实测）：
+ *   ① apply 用 ctx.slots 必须 export const inject = ['slots']（服务注入声明）；
+ *   ② register 必须带 name 字段（= slot 名，如 conversation.view）——缺 name 报
+ *      "slot undefined is not declared"；
+ *   ③ **组件必须作为 slots.register(options, component) 的第二参数，且必须是 React
+ *      组件**。历史写法把组件塞进 options.component = () => ({ render() {} })，
+ *      框架取第二参数得 undefined ⇒ React error #130（Element type is invalid）
+ *      ⇒ 整块 slot 渲染成空白（DSH 0.2+ 只认 React 函数组件）。
  */
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
+import { createElement, useEffect, useRef } from 'react'
 
 type ClientContext = {
   slots: SlotsService
@@ -399,23 +405,60 @@ type ClientContext = {
 
 export const inject = ['slots']
 
+/**
+ * 面板 DOM（与框架无关），由 React 壳负责挂载与清理。
+ * @returns 根节点与卸载清理函数。
+ */
+function mountPanel(): { node: HTMLElement; dispose: () => void } {
+  const el = document.createElement('div')
+  el.textContent = "${pkgName} 面板（host API: /${pkgName}/api）"
+  el.style.padding = '12px'
+  el.style.fontFamily = 'monospace'
+  return { node: el, dispose: () => {} }
+}
+
+/**
+ * slot 组件：React 函数组件 + ref 宿主节点，mount/unmount 与副作用的唯一入口。
+ * @returns 承载面板的 React 元素。
+ */
+function Panel() {
+  const hostRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const host = hostRef.current
+    if (host === null) return
+    const mounted = mountPanel()
+    host.append(mounted.node)
+    return () => {
+      mounted.dispose()
+      mounted.node.remove()
+    }
+  }, [])
+  return createElement('div', { ref: hostRef })
+}
+
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('conversation.view', () =>
     ctx.slots.register({
       name: 'conversation.view',
       id: '${pkgName}-panel',
       label: () => ${JSON.stringify(pkgName)},
-      component: () => ({
-        render() {
-          const el = document.createElement('div')
-          el.textContent = ${JSON.stringify(pkgName)} + ' 面板（host API: /${pkgName}/api）'
-          el.style.padding = '12px'
-          el.style.fontFamily = 'monospace'
-          return el
-        },
-      }),
-    }),
+    }, Panel as never),
   ), '${pkgName}: panel')
+}`
+
+/** 生成给 UI 形态的 React 最小类型声明（不引 @types/react，避免多一个安装依赖）。 */
+const SCAFFOLD_REACT_DTS = `/**
+ * 最小 React 类型声明（构建期类型检查用；运行期由宿主 ModuleLoader 提供真实 React）。
+ * 需要更多符号时在此追加，不要引 @types/react —— 本包以 git 源安装，多一个
+ * devDependency 就多一处安装失败面。
+ */
+declare module 'react' {
+  export interface MutableRefObject<T> {
+    current: T
+  }
+  export function createElement(type: unknown, props?: unknown, ...children: unknown[]): unknown
+  export function useEffect(effect: () => void | (() => void), deps?: readonly unknown[]): void
+  export function useRef<T>(initial: T): MutableRefObject<T>
 }
 `
 
@@ -2612,6 +2655,14 @@ export function apply(ctx: AppContext, config: Config): void {
     // 原检查假定「client = 一定注册 slot」，于是要求 inject 含 slots + register 带合法 name。
     // 现在只在**代码真的引用 slots** 时才要求这两项——「想注册却忘了声明 inject」照样抓得住。
     const usesSlots = (text: string): boolean => /ctx\.slots|slots\.register/.test(text)
+    /**
+     * 老式组件渲染器检测（2026-10-22 实测：DSH 0.2+ 下整块 slot 空白）。
+     * 特征极特异：component: () => ({ render( —— 组件被塞进 options，而不是作为
+     * slots.register(options, component) 的第二参数。命中即必然崩（React error
+     * #130 Element type is invalid），因此按阻断项处理。
+     */
+    const legacyComponentRenderer = (text: string): boolean =>
+      /component\s*:\s*\(\s*\)\s*=>\s*\(\s*\{\s*render\s*\(/.test(text)
     try {
       // 1. 编译产物（实际运行文件）——lib/client.js（CJS bundle）
       // ⚠️ 正则兼容单双引号（实测：用户手修用 "slots" 双引号——只认单引号会误判健康插件）
@@ -2625,6 +2676,9 @@ export function apply(ctx: AppContext, config: Config): void {
           if (!REGISTER_NAME.test(lib)) {
             problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
           }
+          if (legacyComponentRenderer(lib)) {
+            problems.push('lib/client.js 用老式组件渲染器 component: () => ({ render() {} })——DSH 0.2+ 只认 register(options, Component) 的第二参数，老写法报 React error #130、整块 slot 空白；改用 React 组件作第二参数后重新构建')
+          }
         }
       }
       // 2. 源码骨架（有 src 时）
@@ -2637,6 +2691,9 @@ export function apply(ctx: AppContext, config: Config): void {
           }
           if (!REGISTER_NAME.test(src)) {
             problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
+          }
+          if (legacyComponentRenderer(src)) {
+            problems.push('src/client/index.ts 用老式组件渲染器 component: () => ({ render() {} })——组件必须是 register 的第二参数且为 React 组件（DSH 0.2+），否则整块 slot 空白')
           }
         }
       }
@@ -3715,11 +3772,13 @@ export function apply(ctx: AppContext, config: Config): void {
           files.push(['src/index.ts', scaffoldUiSrc(pkgName, args.description ?? '')])
           files.push(['src/client/index.ts', SCAFFOLD_UI_CLIENT(pkgName)])
           files.push(['tsdown.config.ts', SCAFFOLD_TSDOWN(pkgName)])
+          files.push(['src/client/react.d.ts', SCAFFOLD_REACT_DTS])
         } else {
           // hybrid：工具 + 守护循环
           files.push(['src/index.ts', scaffoldDaemonSrc(pkgName, args.description ?? '')])
           files.push(['src/client/index.ts', SCAFFOLD_UI_CLIENT(pkgName)])
           files.push(['tsdown.config.ts', SCAFFOLD_TSDOWN(pkgName)])
+          files.push(['src/client/react.d.ts', SCAFFOLD_REACT_DTS])
         }
         for (const [rel, content] of files) {
           const full = join(targetDir, rel)
